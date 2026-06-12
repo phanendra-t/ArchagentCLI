@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ARCHAGENT_VERSION="0.1.0"
+ARCHAGENT_VERSION="0.2.0"
 DEFAULT_SERVER="http://localhost:8000"
 SERVER=""
 QUIET=false
@@ -398,7 +398,7 @@ services:
       retries: 5
 
   engine:
-    image: phanitirumala/archagent-engine:latest
+    image: phanitirumala/archagent-engine:0.2.0
     container_name: archagent-engine
     ports:
       - "${ARCHAGENT_ENGINE_PORT:-8000}:8000"
@@ -415,7 +415,7 @@ services:
     restart: unless-stopped
 
   dashboard:
-    image: phanitirumala/archagent-dashboard:latest
+    image: phanitirumala/archagent-dashboard:0.2.0
     container_name: archagent-dashboard
     ports:
       - "${ARCHAGENT_DASHBOARD_PORT:-3000}:3000"

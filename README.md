@@ -6,6 +6,15 @@ ArchAgent catches architectural drift in pull requests: cross-boundary dependenc
 
 ---
 
+## What's New in v0.2.0
+
+- **Review history persists** — every review is saved to PostgreSQL and visible in the dashboard at `/reviews`
+- **Per-review detail view** — click any past review to see full findings, diff preview, and annotation status at `/reviews/[id]`
+- **Interactive Review page** — the dashboard at `/review` accepts any unified diff via paste or file upload
+- **Pinned image versions** — `archagent init` generates compose files pinned to `0.2.0` for reproducibility
+
+---
+
 ## Install
 
 ```bash
@@ -40,7 +49,8 @@ docker compose up -d
 git diff HEAD~1 | archagent review --diff -
 
 # 5. Open the dashboard
-open http://localhost:3000
+open http://localhost:3000/review     # Submit diffs interactively
+open http://localhost:3000/reviews    # Browse review history
 ```
 
 ---
@@ -66,9 +76,9 @@ ArchAgent has three components:
 
 | Component | Image | Port |
 |-----------|-------|------|
-| Engine | `phanitirumala/archagent-engine` | 8000 |
-| Dashboard | `phanitirumala/archagent-dashboard` | 3000 |
-| CLI (this repo) | bash script | — |
+| Engine | `phanitirumala/archagent-engine:0.2.0` | 8000 |
+| Dashboard | `phanitirumala/archagent-dashboard:0.2.0` | 3000 |
+| CLI (this repo) | bash script v0.2.0 | — |
 
 The CLI is a thin HTTP client. The engine runs the LLM agents and reward model. The dashboard provides a web UI for feedback and metrics.
 
