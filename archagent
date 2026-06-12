@@ -1,0 +1,771 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ARCHAGENT_VERSION="0.1.0"
+DEFAULT_SERVER="http://localhost:8000"
+SERVER=""
+QUIET=false
+
+# ── Server URL Discovery (4-step) ──
+discover_server() {
+    # 1. --server flag (set during arg parsing, takes precedence)
+    [ -n "${SERVER:-}" ] && return 0
+    # 2. Environment variable
+    [ -n "${ARCHAGENT_SERVER:-}" ] && SERVER="$ARCHAGENT_SERVER" && return 0
+    # 3. Walk up dirs looking for .archagent/config
+    local dir="$PWD"
+    while [ "$dir" != "/" ]; do
+        if [ -f "$dir/.archagent/config" ]; then
+            SERVER=$(grep '^server=' "$dir/.archagent/config" | head -1 | cut -d= -f2-)
+            [ -n "$SERVER" ] && return 0
+        fi
+        dir=$(dirname "$dir")
+    done
+    # 4. Default
+    SERVER="$DEFAULT_SERVER"
+}
+
+# ── Dependency Checks ──
+require_deps() {
+    for dep in curl jq; do
+        if ! command -v "$dep" &>/dev/null; then
+            echo "Error: $dep not found. Install with: brew install $dep (macOS) or apt install $dep (Linux)" >&2
+            exit 1
+        fi
+    done
+}
+
+# ── HTTP Helpers ──
+http_post() {
+    local path="$1" body="$2"
+    curl -fsS -X POST -H "Content-Type: application/json" -d "$body" "${SERVER}${path}"
+}
+
+http_get() {
+    local path="$1"
+    curl -fsS "${SERVER}${path}"
+}
+
+# ── ANSI Colors ──
+C_RED=$'\033[31m'; C_YELLOW=$'\033[33m'; C_BLUE=$'\033[34m'
+C_GREEN=$'\033[32m'; C_DIM=$'\033[2m'; C_BOLD=$'\033[1m'; C_RESET=$'\033[0m'
+
+# ── Format: review (text) ──
+format_review_text() {
+    local json="$1"
+    local health=$(echo "$json" | jq -r '.health_score')
+    local review_id=$(echo "$json" | jq -r '.review_id')
+    local reward=$(echo "$json" | jq -r '.reward_model_active')
+    local total=$(echo "$json" | jq -r '.findings | length')
+
+    # Header
+    echo "${C_BOLD}ArchAgent Review${C_RESET}"
+    echo "${C_DIM}Review ID:${C_RESET} $review_id  ${C_DIM}Health:${C_RESET} $health/100  ${C_DIM}Reward:${C_RESET} $reward"
+    echo
+
+    # Summary
+    if [ "$total" = "0" ]; then
+        echo "${C_GREEN}No architectural violations detected.${C_RESET}"
+        return 0
+    fi
+    echo "Found $total findings:"
+    echo
+
+    # Findings
+    echo "$json" | jq -c '.findings[]' | while IFS= read -r finding; do
+        local severity=$(echo "$finding" | jq -r '.severity')
+        local title=$(echo "$finding" | jq -r '.title')
+        local desc=$(echo "$finding" | jq -r '.description')
+        local impact=$(echo "$finding" | jq -r '.impact')
+        local rec=$(echo "$finding" | jq -r '.recommendation')
+        local rule=$(echo "$finding" | jq -r '.rule_violated // ""')
+        local id=$(echo "$finding" | jq -r '.id')
+        local conf=$(echo "$finding" | jq -r '.confidence')
+
+        local color icon
+        case "$severity" in
+            critical) color="$C_RED"; icon="[CRIT]" ;;
+            high)     color="$C_YELLOW"; icon="[HIGH]" ;;
+            medium)   color="$C_BLUE"; icon="[MED]" ;;
+            low)      color="$C_DIM"; icon="[LOW]" ;;
+            *)        color="$C_DIM"; icon="[ADV]" ;;
+        esac
+
+        echo "${color}${icon} $(echo "$severity" | tr '[:lower:]' '[:upper:]')${C_RESET}  ${C_BOLD}$title${C_RESET}"
+
+        # Evidence
+        echo "$finding" | jq -c '.evidence[]' 2>/dev/null | while IFS= read -r ev; do
+            local file=$(echo "$ev" | jq -r '.file_path')
+            local line=$(echo "$ev" | jq -r '.line_number // ""')
+            local code=$(echo "$ev" | jq -r '.code_snippet // ""')
+            if [ -n "$line" ]; then
+                echo "  ${C_DIM}$file:$line${C_RESET}"
+            else
+                echo "  ${C_DIM}$file${C_RESET}"
+            fi
+            [ -n "$code" ] && echo "  ${C_GREEN}|${C_RESET} $code"
+        done
+
+        echo
+        echo "  ${C_BOLD}Why:${C_RESET} $desc"
+        echo "  ${C_BOLD}Impact:${C_RESET} $impact"
+        echo "  ${C_BOLD}Fix:${C_RESET} $rec"
+        [ -n "$rule" ] && echo "  ${C_DIM}Rule: $rule${C_RESET}"
+        echo "  ${C_DIM}ID: $id  Confidence: $conf${C_RESET}"
+        echo
+    done
+
+    echo "${C_DIM}To provide feedback:${C_RESET}"
+    echo "  archagent feedback $review_id <finding-id> valid"
+    echo "  archagent feedback $review_id <finding-id> false_positive"
+}
+
+# ── Format: stats ──
+format_stats() {
+    local json="$1"
+    local count=$(echo "$json" | jq -r '.annotation_count')
+    local threshold=$(echo "$json" | jq -r '.cold_start_threshold')
+    local active=$(echo "$json" | jq -r '.reward_model_active')
+
+    echo "${C_BOLD}ArchAgent Statistics${C_RESET}"
+    echo "  Total annotations: $count"
+    echo "  Cold start threshold: $threshold"
+    if [ "$active" = "true" ]; then
+        echo "  Reward model: ${C_GREEN}ACTIVE${C_RESET}"
+    else
+        local needed=$(echo "$json" | jq -r '.annotations_needed')
+        echo "  Reward model: ${C_RED}INACTIVE${C_RESET} ($needed more annotations needed)"
+    fi
+}
+
+# ── cmd_review ──
+cmd_review() {
+    local diff_source="-"
+    local intent_file=""
+    local format="text"
+    local fail_on=""
+    local no_reward=false
+    local output=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --diff) diff_source="$2"; shift 2 ;;
+            --intent) intent_file="$2"; shift 2 ;;
+            --format) format="$2"; shift 2 ;;
+            --fail-on) fail_on="$2"; shift 2 ;;
+            --no-reward) no_reward=true; shift ;;
+            --output) output="$2"; shift 2 ;;
+            --quiet) QUIET=true; shift ;;
+            *) echo "Unknown option: $1" >&2; exit 2 ;;
+        esac
+    done
+
+    # Read diff
+    local diff_content
+    if [ "$diff_source" = "-" ]; then
+        diff_content=$(cat)
+    else
+        [ -f "$diff_source" ] || { echo "Diff file not found: $diff_source" >&2; exit 1; }
+        diff_content=$(cat "$diff_source")
+    fi
+
+    [ -z "$diff_content" ] && { echo "Error: empty diff" >&2; exit 1; }
+
+    # Build request body
+    local body
+    if [ -n "$intent_file" ]; then
+        [ -f "$intent_file" ] || { echo "Intent file not found: $intent_file" >&2; exit 1; }
+        local intent_yaml
+        intent_yaml=$(cat "$intent_file")
+        body=$(jq -n --arg diff "$diff_content" --arg yaml "$intent_yaml" '{diff: $diff, intent_yaml: $yaml}')
+    else
+        body=$(jq -n --arg diff "$diff_content" '{diff: $diff}')
+    fi
+
+    [ "$QUIET" = false ] && echo "${C_DIM}Reviewing diff against architectural intent...${C_RESET}" >&2
+
+    # POST to engine
+    local query=""
+    [ "$no_reward" = true ] && query="?no_reward=true"
+
+    local response
+    response=$(http_post "/api/review${query}" "$body") || {
+        echo "Review failed. Check that engine is running at $SERVER" >&2
+        echo "  Start with: docker compose up -d" >&2
+        exit 1
+    }
+
+    # Format output
+    local output_content
+    case "$format" in
+        json) output_content="$response" ;;
+        text) output_content=$(format_review_text "$response") ;;
+        *)    output_content=$(format_review_text "$response") ;;
+    esac
+
+    if [ -n "$output" ]; then
+        echo "$output_content" > "$output"
+        [ "$QUIET" = false ] && echo "${C_GREEN}Written to $output${C_RESET}" >&2
+    else
+        echo "$output_content"
+    fi
+
+    # --fail-on logic
+    if [ -n "$fail_on" ]; then
+        local severities
+        severities=$(echo "$response" | jq -r '.findings[].severity')
+        local should_fail=false
+
+        case "$fail_on" in
+            critical)
+                echo "$severities" | grep -q "^critical$" && should_fail=true ;;
+            high)
+                echo "$severities" | grep -qE "^(critical|high)$" && should_fail=true ;;
+            medium)
+                echo "$severities" | grep -qE "^(critical|high|medium)$" && should_fail=true ;;
+            low)
+                echo "$severities" | grep -qE "^(critical|high|medium|low)$" && should_fail=true ;;
+        esac
+
+        if [ "$should_fail" = true ]; then
+            exit 1
+        fi
+    fi
+}
+
+# ── cmd_feedback ──
+cmd_feedback() {
+    [ $# -lt 3 ] && { echo "Usage: archagent feedback <review-id> <finding-id> <label>" >&2; exit 2; }
+    local review_id="$1" finding_id="$2" label="$3"
+
+    local body
+    body=$(jq -n --arg rid "$review_id" --arg fid "$finding_id" --arg lbl "$label" \
+        '{review_id: $rid, finding_id: $fid, label: $lbl}')
+
+    local response
+    response=$(http_post "/api/feedback" "$body") || {
+        echo "Feedback submission failed. Is engine running at $SERVER?" >&2
+        exit 1
+    }
+
+    local count=$(echo "$response" | jq -r '.annotation_count')
+    local active=$(echo "$response" | jq -r '.reward_model_active')
+    echo "${C_GREEN}✓${C_RESET} Feedback saved. Total annotations: $count. Reward model active: $active"
+}
+
+# ── cmd_stats ──
+cmd_stats() {
+    local response
+    response=$(http_get "/api/feedback/stats") || {
+        echo "Failed to fetch stats. Is engine running at $SERVER?" >&2
+        exit 1
+    }
+    format_stats "$response"
+}
+
+# ── cmd_retrain ──
+cmd_retrain() {
+    [ "$QUIET" = false ] && echo "${C_DIM}Retraining reward model...${C_RESET}" >&2
+
+    local response
+    response=$(http_post "/api/feedback/retrain" "{}") || {
+        echo "Retrain failed. Is engine running at $SERVER?" >&2
+        exit 1
+    }
+
+    local status=$(echo "$response" | jq -r '.status')
+    if [ "$status" = "error" ] || [ "$status" = "insufficient_data" ]; then
+        local detail=$(echo "$response" | jq -r '.detail // .status')
+        echo "${C_RED}✗${C_RESET} $detail" >&2
+        exit 1
+    fi
+
+    local accuracy=$(echo "$response" | jq -r '.accuracy')
+    local precision=$(echo "$response" | jq -r '.precision')
+    local recall=$(echo "$response" | jq -r '.recall')
+    local f1=$(echo "$response" | jq -r '.f1')
+
+    echo "${C_BOLD}Reward Model Retrained${C_RESET}"
+    echo "  Accuracy:  $accuracy"
+    echo "  Precision: $precision"
+    echo "  Recall:    $recall"
+    echo "  F1 Score:  $f1"
+    echo "${C_GREEN}✓${C_RESET} Done."
+}
+
+# ── cmd_init ──
+cmd_init() {
+    local template="minimal"
+    local system_name="my-system"
+    local force=false
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --template|-t) template="$2"; shift 2 ;;
+            --name|-n) system_name="$2"; shift 2 ;;
+            --force|-f) force=true; shift ;;
+            *) echo "Unknown option: $1" >&2; exit 2 ;;
+        esac
+    done
+
+    echo "${C_BOLD}ArchAgent Init${C_RESET} — Bootstrapping project..."
+    echo
+
+    # 1. Create architecture-intent.yaml
+    _safe_write "architecture-intent.yaml" "$force" || true
+    if [ $? -eq 0 ] || [ "$force" = true ]; then
+        if [ "$template" = "full" ]; then
+            _write_full_template "architecture-intent.yaml" "$system_name"
+        else
+            _write_minimal_template "architecture-intent.yaml" "$system_name"
+        fi
+        echo "  ${C_GREEN}✓${C_RESET} Created architecture-intent.yaml (${template} template)"
+    fi
+
+    # 2. Create docker-compose.yml
+    if _safe_write "docker-compose.yml" "$force"; then
+        _write_compose_template "docker-compose.yml"
+        echo "  ${C_GREEN}✓${C_RESET} Created docker-compose.yml"
+    fi
+
+    # 3. Create .env with empty API key
+    if _safe_write ".env" "$force"; then
+        _write_env_template ".env"
+        echo "  ${C_GREEN}✓${C_RESET} Created .env (add your ANTHROPIC_API_KEY)"
+    fi
+
+    # 4. Create .gitignore entries (append if exists, create if not)
+    _ensure_gitignore
+
+    echo
+    echo "${C_BOLD}Next steps:${C_RESET}"
+    echo "  1. Add your API key:       ${C_DIM}edit .env${C_RESET}"
+    echo "  2. Edit architecture:      ${C_DIM}edit architecture-intent.yaml${C_RESET}"
+    echo "  3. Start the stack:        ${C_DIM}docker compose up -d${C_RESET}"
+    echo "  4. Run first review:       ${C_DIM}archagent review --diff my.diff${C_RESET}"
+    echo "  5. Open dashboard:         ${C_DIM}http://localhost:3000${C_RESET}"
+}
+
+# Helper: check if file exists and prompt unless --force
+_safe_write() {
+    local file="$1" force="$2"
+    if [ -f "$file" ] && [ "$force" != "true" ]; then
+        printf "  ${C_YELLOW}⚠${C_RESET} %s exists. Overwrite? [y/N] " "$file"
+        read -r confirm
+        [ "$confirm" = "y" ] || [ "$confirm" = "Y" ] || return 1
+    fi
+    return 0
+}
+
+# Helper: ensure .gitignore has archagent entries
+_ensure_gitignore() {
+    local marker="# ArchAgent"
+    if [ -f ".gitignore" ]; then
+        if ! grep -q "$marker" ".gitignore" 2>/dev/null; then
+            printf "\n%s\n.env\n*.joblib\narchagent_pgdata/\narchagent_models/\n" "$marker" >> ".gitignore"
+            echo "  ${C_GREEN}✓${C_RESET} Updated .gitignore"
+        fi
+    else
+        cat > ".gitignore" <<'GITIGNORE'
+# ArchAgent
+.env
+*.joblib
+archagent_pgdata/
+archagent_models/
+GITIGNORE
+        echo "  ${C_GREEN}✓${C_RESET} Created .gitignore"
+    fi
+}
+
+_write_compose_template() {
+    cat > "$1" <<'EOF'
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: archagent-postgres
+    environment:
+      POSTGRES_USER: archagent
+      POSTGRES_PASSWORD: archagent
+      POSTGRES_DB: archagent
+    ports:
+      - "${ARCHAGENT_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - archagent_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U archagent"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  engine:
+    image: phanitirumala/archagent-engine:latest
+    container_name: archagent-engine
+    ports:
+      - "${ARCHAGENT_ENGINE_PORT:-8000}:8000"
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      DATABASE_URL: postgresql://archagent:archagent@postgres:5432/archagent
+      ARCHAGENT_DATA_DIR: /app/data
+    volumes:
+      - ./architecture-intent.yaml:/app/architecture-intent.yaml:ro
+      - archagent_models:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  dashboard:
+    image: phanitirumala/archagent-dashboard:latest
+    container_name: archagent-dashboard
+    ports:
+      - "${ARCHAGENT_DASHBOARD_PORT:-3000}:3000"
+    environment:
+      NEXT_PUBLIC_ARCHAGENT_API: http://localhost:${ARCHAGENT_ENGINE_PORT:-8000}
+    depends_on:
+      - engine
+    restart: unless-stopped
+
+volumes:
+  archagent_pgdata:
+  archagent_models:
+EOF
+}
+
+_write_env_template() {
+    cat > "$1" <<'EOF'
+# ArchAgent Configuration
+# Get your key at: https://console.anthropic.com/settings/keys
+ANTHROPIC_API_KEY=
+
+# Optional: override default ports
+# ARCHAGENT_ENGINE_PORT=8000
+# ARCHAGENT_DASHBOARD_PORT=3000
+# ARCHAGENT_POSTGRES_PORT=5432
+EOF
+}
+
+_write_minimal_template() {
+    cat > "$1" <<EOF
+schema_version: "1.0"
+system: "$2"
+
+project:
+  languages: []  # e.g., [typescript, python, go]
+
+# Define your bounded contexts (modules/services that should be isolated)
+bounded_contexts:
+  - name: example-context
+    description: "Description of this context's responsibility"
+    owns:
+      - "src/example/**"
+    allowed_dependencies: []
+    forbidden_dependencies: []
+
+# Define layer rules (e.g., controller -> service -> repository -> model)
+layers:
+  - name: controller
+    pattern: "src/**/controllers/**"
+    allowed_imports_from:
+      - service
+    forbidden_imports_from:
+      - repository
+    rule: "Controllers handle HTTP only"
+
+  - name: service
+    pattern: "src/**/services/**"
+    allowed_imports_from:
+      - repository
+      - model
+    forbidden_imports_from:
+      - controller
+    rule: "Services contain business logic"
+
+  - name: repository
+    pattern: "src/**/repositories/**"
+    allowed_imports_from:
+      - model
+    forbidden_imports_from:
+      - controller
+      - service
+    rule: "Repositories handle data access"
+
+  - name: model
+    pattern: "src/**/models/**"
+    allowed_imports_from: []
+    forbidden_imports_from:
+      - controller
+      - service
+      - repository
+    rule: "Models are pure data — no dependencies"
+
+# Communication patterns between contexts
+communication_patterns: []
+  # - between: [context-a, context-b]
+  #   allowed: event
+  #   forbidden: direct
+  #   reason: "Use domain events for loose coupling"
+
+# Security boundaries
+security_rules: []
+  # - context: payments
+  #   constraints:
+  #     - "No logging of sensitive data"
+
+# Soft principles (advisory)
+principles:
+  - name: "prefer-events-over-direct-coupling"
+    description: "Cross-context communication should use domain events"
+    severity: advisory
+EOF
+}
+
+_write_full_template() {
+    cat > "$1" <<EOF
+schema_version: "1.0"
+system: "$2"
+
+project:
+  languages: [typescript]
+
+bounded_contexts:
+  - name: users
+    description: "User management and authentication"
+    owns:
+      - "src/users/**"
+    allowed_dependencies: []
+    forbidden_dependencies:
+      - orders
+      - payments
+      - notifications
+
+  - name: orders
+    description: "Order lifecycle management"
+    owns:
+      - "src/orders/**"
+    allowed_dependencies:
+      - users
+      - products
+    forbidden_dependencies:
+      - payments
+      - notifications
+
+  - name: payments
+    description: "Payment processing and billing"
+    owns:
+      - "src/payments/**"
+    allowed_dependencies:
+      - orders
+    forbidden_dependencies:
+      - users
+      - products
+      - notifications
+    security_boundary: true
+
+  - name: notifications
+    description: "All outbound communication"
+    owns:
+      - "src/notifications/**"
+    allowed_dependencies: []
+    forbidden_dependencies:
+      - "*"
+
+  - name: products
+    description: "Product catalog and inventory"
+    owns:
+      - "src/products/**"
+    allowed_dependencies: []
+    forbidden_dependencies:
+      - orders
+      - payments
+      - notifications
+
+layers:
+  - name: controller
+    pattern: "src/**/controllers/**"
+    allowed_imports_from: [service]
+    forbidden_imports_from: [repository, model]
+    rule: "Controllers handle HTTP — no business logic"
+
+  - name: service
+    pattern: "src/**/services/**"
+    allowed_imports_from: [repository, model]
+    forbidden_imports_from: [controller]
+    rule: "Services contain business logic"
+
+  - name: repository
+    pattern: "src/**/repositories/**"
+    allowed_imports_from: [model]
+    forbidden_imports_from: [controller, service]
+    rule: "Repositories handle data access"
+
+  - name: model
+    pattern: "src/**/models/**"
+    allowed_imports_from: []
+    forbidden_imports_from: ["*"]
+    rule: "Models are pure data structures"
+
+dependency_rules:
+  - name: "no-circular-context-deps"
+    description: "No circular dependencies between contexts"
+    type: acyclic
+
+  - name: "no-cross-context-model-sharing"
+    description: "Models cannot be imported across contexts"
+    rule: "Each context owns its domain models"
+
+communication_patterns:
+  - between: [orders, notifications]
+    allowed: event
+    forbidden: direct
+    reason: "Notifications subscribe to order events"
+
+  - between: [any, notifications]
+    allowed: event
+    forbidden: direct
+    reason: "All notification triggers via events"
+
+security_rules:
+  - context: payments
+    constraints:
+      - "No logging of card numbers or CVV"
+      - "All external calls via HTTPS"
+      - "No PII in error messages"
+
+principles:
+  - name: "event-driven-communication"
+    description: "Prefer domain events for cross-context communication"
+    severity: warning
+
+  - name: "single-writer-principle"
+    description: "Each entity owned by exactly one context for writes"
+    severity: critical
+
+  - name: "no-shared-database"
+    description: "Contexts must not share database tables"
+    severity: critical
+EOF
+}
+
+# ── cmd_validate ──
+cmd_validate() {
+    local intent_file="${1:-architecture-intent.yaml}"
+    [ -f "$intent_file" ] || { echo "File not found: $intent_file" >&2; exit 1; }
+
+    local yaml_content
+    yaml_content=$(cat "$intent_file")
+    local body
+    body=$(jq -n --arg yaml "$yaml_content" '{intent_yaml: $yaml}')
+
+    [ "$QUIET" = false ] && echo "${C_DIM}Validating $intent_file...${C_RESET}" >&2
+
+    local response
+    response=$(http_post "/api/validate" "$body") || {
+        echo "Validation failed. Is engine running at $SERVER?" >&2
+        exit 1
+    }
+
+    local valid=$(echo "$response" | jq -r '.valid')
+    local error_count=$(echo "$response" | jq -r '.errors | length')
+    local warning_count=$(echo "$response" | jq -r '.warnings | length')
+
+    # Print errors
+    if [ "$error_count" -gt 0 ]; then
+        echo "$response" | jq -r '.errors[]' | while IFS= read -r e; do
+            echo "${C_RED}✗ ERROR:${C_RESET} $e"
+        done
+    fi
+
+    # Print warnings
+    if [ "$warning_count" -gt 0 ]; then
+        echo "$response" | jq -r '.warnings[]' | while IFS= read -r w; do
+            echo "${C_YELLOW}⚠ WARNING:${C_RESET} $w"
+        done
+    fi
+
+    # Summary
+    local summary
+    summary=$(echo "$response" | jq -r '.summary // {}')
+    local contexts=$(echo "$summary" | jq -r '.contexts // [] | length')
+    local layers=$(echo "$summary" | jq -r '.layers // [] | length')
+
+    if [ "$valid" = "true" ]; then
+        echo "${C_GREEN}✓ Validation passed.${C_RESET} ($contexts contexts, $layers layers)"
+        exit 0
+    else
+        echo "${C_RED}✗ Validation failed.${C_RESET}"
+        exit 1
+    fi
+}
+
+# ── cmd_help ──
+cmd_help() {
+    cat <<EOF
+${C_BOLD}ArchAgent${C_RESET} — Agentic Code Review with Architectural Intent Understanding
+
+${C_BOLD}Usage:${C_RESET} archagent [GLOBAL OPTIONS] COMMAND [OPTIONS] [ARGS]
+
+${C_BOLD}Commands:${C_RESET}
+  init        Bootstrap project (creates docker-compose.yml + intent.yaml + .env)
+  review      Review a PR diff against architectural intent
+  feedback    Submit feedback on a finding
+  stats       Show annotation and reward model statistics
+  retrain     Retrain the reward model
+  validate    Validate an architecture-intent.yaml file
+
+${C_BOLD}Global Options:${C_RESET}
+  --server URL     Engine URL (default: $DEFAULT_SERVER)
+  --quiet, -q      Suppress progress messages
+  --version        Show version
+  --help, -h       Show this help
+
+${C_BOLD}Server Discovery (in order):${C_RESET}
+  1. --server flag
+  2. ARCHAGENT_SERVER env var
+  3. .archagent/config in current/parent dirs
+  4. Default: $DEFAULT_SERVER
+
+${C_BOLD}Examples:${C_RESET}
+  archagent init                              # Bootstrap project
+  archagent init --template full --name myapp # Full template
+  archagent validate architecture-intent.yaml # Check intent file
+  docker compose up -d                        # Start engine
+  git diff HEAD~1 | archagent review --diff - # Review last commit
+  archagent review --diff my.diff --fail-on critical
+  archagent feedback abc123 ctx-d6b571 valid
+  archagent stats
+EOF
+}
+
+# ── main ──
+main() {
+    require_deps
+
+    # Parse global options
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --server) SERVER="$2"; shift 2 ;;
+            --quiet|-q) QUIET=true; shift ;;
+            --version) echo "archagent $ARCHAGENT_VERSION"; exit 0 ;;
+            --help|-h) cmd_help; exit 0 ;;
+            review|feedback|stats|retrain|init|validate) break ;;
+            *) echo "Unknown option: $1" >&2; cmd_help; exit 2 ;;
+        esac
+    done
+
+    [ $# -eq 0 ] && { cmd_help; exit 0; }
+
+    discover_server
+
+    local cmd="$1"; shift
+    case "$cmd" in
+        review)   cmd_review "$@" ;;
+        feedback) cmd_feedback "$@" ;;
+        stats)    cmd_stats ;;
+        retrain)  cmd_retrain ;;
+        init)     cmd_init "$@" ;;
+        validate) cmd_validate "$@" ;;
+        *)        echo "Unknown command: $cmd" >&2; cmd_help; exit 2 ;;
+    esac
+}
+
+main "$@"
