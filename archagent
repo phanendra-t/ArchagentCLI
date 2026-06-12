@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ARCHAGENT_VERSION="0.2.0"
+ARCHAGENT_VERSION="0.2.1"
 DEFAULT_SERVER="http://localhost:8000"
 SERVER=""
 QUIET=false
@@ -295,13 +295,12 @@ cmd_retrain() {
 
 # ── cmd_init ──
 cmd_init() {
-    local template="minimal"
     local system_name="my-system"
     local force=false
 
     while [ $# -gt 0 ]; do
         case "$1" in
-            --template|-t) template="$2"; shift 2 ;;
+            --template|-t) shift 2 ;;  # Accepted for backward compat, ignored
             --name|-n) system_name="$2"; shift 2 ;;
             --force|-f) force=true; shift ;;
             *) echo "Unknown option: $1" >&2; exit 2 ;;
@@ -311,15 +310,10 @@ cmd_init() {
     echo "${C_BOLD}ArchAgent Init${C_RESET} — Bootstrapping project..."
     echo
 
-    # 1. Create architecture-intent.yaml
-    _safe_write "architecture-intent.yaml" "$force" || true
-    if [ $? -eq 0 ] || [ "$force" = true ]; then
-        if [ "$template" = "full" ]; then
-            _write_full_template "architecture-intent.yaml" "$system_name"
-        else
-            _write_minimal_template "architecture-intent.yaml" "$system_name"
-        fi
-        echo "  ${C_GREEN}✓${C_RESET} Created architecture-intent.yaml (${template} template)"
+    # 1. Create architecture-intent.yaml from cached example or embedded fallback
+    if _safe_write "architecture-intent.yaml" "$force"; then
+        _write_intent_file "architecture-intent.yaml" "$system_name"
+        echo "  ${C_GREEN}✓${C_RESET} Created architecture-intent.yaml"
     fi
 
     # 2. Create docker-compose.yml
@@ -343,7 +337,7 @@ cmd_init() {
     echo "  2. Edit architecture:      ${C_DIM}edit architecture-intent.yaml${C_RESET}"
     echo "  3. Start the stack:        ${C_DIM}docker compose up -d${C_RESET}"
     echo "  4. Run first review:       ${C_DIM}archagent review --diff my.diff${C_RESET}"
-    echo "  5. Open dashboard:         ${C_DIM}http://localhost:3000${C_RESET}"
+    echo "  5. Open dashboard:         ${C_DIM}http://localhost:3000/review${C_RESET}"
 }
 
 # Helper: check if file exists and prompt unless --force
@@ -444,147 +438,33 @@ ANTHROPIC_API_KEY=
 EOF
 }
 
-_write_minimal_template() {
-    cat > "$1" <<EOF
+_write_intent_file() {
+    local target="$1" system_name="$2"
+    local cache_file="$HOME/.local/share/archagent/architecture-intent.example.yaml"
+
+    if [ -f "$cache_file" ]; then
+        # Use cached example file and substitute system name
+        sed "s/system: \"my-app\"/system: \"$system_name\"/" "$cache_file" > "$target"
+    else
+        # Fallback: embedded minimal template
+        cat > "$target" <<INTENT
 schema_version: "1.0"
-system: "$2"
+system: "$system_name"
 
-project:
-  languages: []  # e.g., [typescript, python, go]
-
-# Define your bounded contexts (modules/services that should be isolated)
 bounded_contexts:
   - name: example-context
-    description: "Description of this context's responsibility"
+    description: "Your module description"
     owns:
       - "src/example/**"
     allowed_dependencies: []
     forbidden_dependencies: []
-
-# Define layer rules (e.g., controller -> service -> repository -> model)
-layers:
-  - name: controller
-    pattern: "src/**/controllers/**"
-    allowed_imports_from:
-      - service
-    forbidden_imports_from:
-      - repository
-    rule: "Controllers handle HTTP only"
-
-  - name: service
-    pattern: "src/**/services/**"
-    allowed_imports_from:
-      - repository
-      - model
-    forbidden_imports_from:
-      - controller
-    rule: "Services contain business logic"
-
-  - name: repository
-    pattern: "src/**/repositories/**"
-    allowed_imports_from:
-      - model
-    forbidden_imports_from:
-      - controller
-      - service
-    rule: "Repositories handle data access"
-
-  - name: model
-    pattern: "src/**/models/**"
-    allowed_imports_from: []
-    forbidden_imports_from:
-      - controller
-      - service
-      - repository
-    rule: "Models are pure data — no dependencies"
-
-# Communication patterns between contexts
-communication_patterns: []
-  # - between: [context-a, context-b]
-  #   allowed: event
-  #   forbidden: direct
-  #   reason: "Use domain events for loose coupling"
-
-# Security boundaries
-security_rules: []
-  # - context: payments
-  #   constraints:
-  #     - "No logging of sensitive data"
-
-# Soft principles (advisory)
-principles:
-  - name: "prefer-events-over-direct-coupling"
-    description: "Cross-context communication should use domain events"
-    severity: advisory
-EOF
-}
-
-_write_full_template() {
-    cat > "$1" <<EOF
-schema_version: "1.0"
-system: "$2"
-
-project:
-  languages: [typescript]
-
-bounded_contexts:
-  - name: users
-    description: "User management and authentication"
-    owns:
-      - "src/users/**"
-    allowed_dependencies: []
-    forbidden_dependencies:
-      - orders
-      - payments
-      - notifications
-
-  - name: orders
-    description: "Order lifecycle management"
-    owns:
-      - "src/orders/**"
-    allowed_dependencies:
-      - users
-      - products
-    forbidden_dependencies:
-      - payments
-      - notifications
-
-  - name: payments
-    description: "Payment processing and billing"
-    owns:
-      - "src/payments/**"
-    allowed_dependencies:
-      - orders
-    forbidden_dependencies:
-      - users
-      - products
-      - notifications
-    security_boundary: true
-
-  - name: notifications
-    description: "All outbound communication"
-    owns:
-      - "src/notifications/**"
-    allowed_dependencies: []
-    forbidden_dependencies:
-      - "*"
-
-  - name: products
-    description: "Product catalog and inventory"
-    owns:
-      - "src/products/**"
-    allowed_dependencies: []
-    forbidden_dependencies:
-      - orders
-      - payments
-      - notifications
 
 layers:
   - name: controller
     pattern: "src/**/controllers/**"
     allowed_imports_from: [service]
     forbidden_imports_from: [repository, model]
-    rule: "Controllers handle HTTP — no business logic"
+    rule: "Controllers handle HTTP only"
 
   - name: service
     pattern: "src/**/services/**"
@@ -601,49 +481,14 @@ layers:
   - name: model
     pattern: "src/**/models/**"
     allowed_imports_from: []
-    forbidden_imports_from: ["*"]
+    forbidden_imports_from: [controller, service, repository]
     rule: "Models are pure data structures"
 
-dependency_rules:
-  - name: "no-circular-context-deps"
-    description: "No circular dependencies between contexts"
-    type: acyclic
+communication_patterns: []
 
-  - name: "no-cross-context-model-sharing"
-    description: "Models cannot be imported across contexts"
-    rule: "Each context owns its domain models"
-
-communication_patterns:
-  - between: [orders, notifications]
-    allowed: event
-    forbidden: direct
-    reason: "Notifications subscribe to order events"
-
-  - between: [any, notifications]
-    allowed: event
-    forbidden: direct
-    reason: "All notification triggers via events"
-
-security_rules:
-  - context: payments
-    constraints:
-      - "No logging of card numbers or CVV"
-      - "All external calls via HTTPS"
-      - "No PII in error messages"
-
-principles:
-  - name: "event-driven-communication"
-    description: "Prefer domain events for cross-context communication"
-    severity: warning
-
-  - name: "single-writer-principle"
-    description: "Each entity owned by exactly one context for writes"
-    severity: critical
-
-  - name: "no-shared-database"
-    description: "Contexts must not share database tables"
-    severity: critical
-EOF
+security_rules: []
+INTENT
+    fi
 }
 
 # ── cmd_validate ──
@@ -697,6 +542,53 @@ cmd_validate() {
     fi
 }
 
+# ── cmd_update ──
+cmd_update() {
+    local repo_url="https://raw.githubusercontent.com/phanendra-t/ArchagentCLI/main"
+    local install_path
+    install_path=$(command -v archagent 2>/dev/null || echo "$HOME/.local/bin/archagent")
+    local share_dir="$HOME/.local/share/archagent"
+
+    echo "${C_BOLD}ArchAgent Update${C_RESET}"
+    echo
+
+    # Fetch remote version
+    echo "Checking for updates..."
+    local remote_script
+    remote_script=$(curl -fsSL "$repo_url/archagent" 2>/dev/null) || {
+        echo "${C_RED}✗${C_RESET} Failed to fetch latest version. Check your internet connection." >&2
+        exit 1
+    }
+
+    local remote_version
+    remote_version=$(echo "$remote_script" | grep '^ARCHAGENT_VERSION=' | head -1 | sed 's/ARCHAGENT_VERSION="\(.*\)"/\1/')
+
+    echo "  Current: $ARCHAGENT_VERSION"
+    echo "  Latest:  $remote_version"
+    echo
+
+    if [ "$remote_version" = "$ARCHAGENT_VERSION" ]; then
+        echo "${C_GREEN}✓${C_RESET} Already on the latest version."
+        return 0
+    fi
+
+    # Update the script
+    echo "Updating archagent..."
+    echo "$remote_script" > "$install_path.new"
+    chmod +x "$install_path.new"
+    mv "$install_path.new" "$install_path"
+    echo "  ${C_GREEN}✓${C_RESET} Updated script to $remote_version"
+
+    # Update cached example file
+    mkdir -p "$share_dir"
+    if curl -fsSL "$repo_url/architecture-intent.example.yaml" -o "$share_dir/architecture-intent.example.yaml" 2>/dev/null; then
+        echo "  ${C_GREEN}✓${C_RESET} Updated example intent file"
+    fi
+
+    echo
+    echo "${C_GREEN}✓ Updated to $remote_version${C_RESET}"
+}
+
 # ── cmd_help ──
 cmd_help() {
     cat <<EOF
@@ -711,6 +603,7 @@ ${C_BOLD}Commands:${C_RESET}
   stats       Show annotation and reward model statistics
   retrain     Retrain the reward model
   validate    Validate an architecture-intent.yaml file
+  update      Update CLI to the latest version
 
 ${C_BOLD}Global Options:${C_RESET}
   --server URL     Engine URL (default: $DEFAULT_SERVER)
@@ -726,8 +619,9 @@ ${C_BOLD}Server Discovery (in order):${C_RESET}
 
 ${C_BOLD}Examples:${C_RESET}
   archagent init                              # Bootstrap project
-  archagent init --template full --name myapp # Full template
+  archagent init --name myapp                 # With custom system name
   archagent validate architecture-intent.yaml # Check intent file
+  archagent update                            # Update CLI to latest
   docker compose up -d                        # Start engine
   git diff HEAD~1 | archagent review --diff - # Review last commit
   archagent review --diff my.diff --fail-on critical
@@ -747,7 +641,7 @@ main() {
             --quiet|-q) QUIET=true; shift ;;
             --version) echo "archagent $ARCHAGENT_VERSION"; exit 0 ;;
             --help|-h) cmd_help; exit 0 ;;
-            review|feedback|stats|retrain|init|validate) break ;;
+            review|feedback|stats|retrain|init|validate|update) break ;;
             *) echo "Unknown option: $1" >&2; cmd_help; exit 2 ;;
         esac
     done
@@ -764,6 +658,7 @@ main() {
         retrain)  cmd_retrain ;;
         init)     cmd_init "$@" ;;
         validate) cmd_validate "$@" ;;
+        update)   cmd_update ;;
         *)        echo "Unknown command: $cmd" >&2; cmd_help; exit 2 ;;
     esac
 }

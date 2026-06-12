@@ -1,0 +1,192 @@
+# ArchAgent Architecture Intent — v0.2.1
+# ==========================================
+#
+# This file defines your system's architectural rules.
+# ArchAgent uses it to detect violations in PR diffs.
+#
+# Enforced rule categories (v0.2.1):
+#   - bounded_contexts: module isolation and dependency rules
+#   - layers: layered architecture import rules
+#   - communication_patterns: event vs direct call rules (LLM-interpreted)
+#   - security_rules: data protection constraints (LLM-interpreted)
+#
+# Place this file at the root of your project.
+# The engine reads it on every review — edits take effect immediately.
+
+schema_version: "1.0"
+
+# System name — identifies this project in the dashboard's review history.
+# Shown in /reviews page and stored in the database.
+system: "my-app"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BOUNDED CONTEXTS
+# ─────────────────────────────────────────────────────────────────────────────
+# Define your system's modules/domains and their dependency rules.
+#
+# Each context:
+#   - name: unique identifier (referenced by other sections)
+#   - description: human-readable purpose (shown in LLM prompts)
+#   - owns: list of glob patterns — files matching these belong to this context
+#   - allowed_dependencies: contexts this one MAY import from
+#   - forbidden_dependencies: contexts this one MUST NOT import from
+#   - security_boundary: marks files for extra security scrutiny
+#
+# Dependency logic:
+#   - If forbidden_dependencies is set and target is listed → VIOLATION
+#   - If allowed_dependencies is set and target is NOT listed → VIOLATION
+#   - If both empty → no outbound import checks for this context
+
+bounded_contexts:
+  - name: orders
+    description: "Handles order lifecycle from creation to fulfillment"
+    owns:
+      - "src/orders/**"
+    allowed_dependencies:
+      - products
+      - pricing
+    forbidden_dependencies:
+      - notifications
+      - analytics
+
+  - name: payments
+    description: "Payment processing, refunds, and billing"
+    owns:
+      - "src/payments/**"
+    allowed_dependencies:
+      - orders
+    forbidden_dependencies:
+      - products
+      - notifications
+      - analytics
+    security_boundary: true
+
+  - name: notifications
+    description: "All outbound communication (email, SMS, push)"
+    owns:
+      - "src/notifications/**"
+    allowed_dependencies: []
+    forbidden_dependencies:
+      - orders
+      - payments
+      - analytics
+
+  - name: analytics
+    description: "Reporting and business intelligence"
+    owns:
+      - "src/analytics/**"
+    allowed_dependencies: []
+    forbidden_dependencies:
+      - orders
+      - payments
+      - notifications
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LAYERS
+# ─────────────────────────────────────────────────────────────────────────────
+# Define your layered architecture rules.
+#
+# Each layer:
+#   - name: unique identifier
+#   - pattern: glob matching files in this layer
+#   - allowed_imports_from: layers this one CAN import from
+#   - forbidden_imports_from: layers this one MUST NOT import from
+#   - rule: human-readable explanation (shown in LLM prompts)
+#
+# Import logic (same as bounded_contexts):
+#   - If forbidden_imports_from is set and target layer listed → VIOLATION
+#   - If allowed_imports_from is set and target NOT listed → VIOLATION
+
+layers:
+  - name: controller
+    pattern: "src/**/controllers/**"
+    allowed_imports_from:
+      - service
+    forbidden_imports_from:
+      - repository
+      - model
+    rule: "Controllers handle HTTP only — delegate all logic to services"
+
+  - name: service
+    pattern: "src/**/services/**"
+    allowed_imports_from:
+      - repository
+      - model
+      - event
+    forbidden_imports_from:
+      - controller
+    rule: "Services contain business logic — no HTTP awareness"
+
+  - name: repository
+    pattern: "src/**/repositories/**"
+    allowed_imports_from:
+      - model
+    forbidden_imports_from:
+      - controller
+      - service
+    rule: "Repositories handle data access only"
+
+  - name: model
+    pattern: "src/**/models/**"
+    allowed_imports_from: []
+    forbidden_imports_from:
+      - controller
+      - service
+      - repository
+    rule: "Models are pure data structures — no dependencies"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COMMUNICATION PATTERNS
+# ─────────────────────────────────────────────────────────────────────────────
+# Define how bounded contexts should communicate.
+#
+# Each pattern:
+#   - between: exactly 2 context names (or "any" as wildcard)
+#   - allowed: "event" or "direct"
+#   - forbidden: opposite of allowed (optional)
+#   - pattern: additional detail (optional, shown in prompts)
+#   - reason: why this rule exists (optional, shown in prompts)
+#
+# Enforcement: LLM-interpreted by the Context Boundary Reviewer.
+# The agent checks whether cross-context calls use the allowed mechanism.
+# No deterministic pre-check — relies on semantic analysis.
+
+communication_patterns:
+  - between: [orders, notifications]
+    allowed: event
+    forbidden: direct
+    reason: "Orders emits events; Notifications subscribes. No direct coupling."
+
+  - between: [orders, payments]
+    allowed: direct
+    pattern: "via PaymentGateway interface only"
+
+  - between: [any, analytics]
+    allowed: event
+    forbidden: direct
+    reason: "Analytics is a read-model populated by domain events only"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECURITY RULES
+# ─────────────────────────────────────────────────────────────────────────────
+# Define security constraints for specific contexts.
+#
+# Each rule:
+#   - context: must match a bounded_contexts name
+#   - constraints: list of natural-language rules (be specific!)
+#
+# Enforcement: LLM-interpreted by the Security Boundary Reviewer.
+# Files in contexts with security_boundary: true get extra scrutiny.
+# Write constraints as imperative statements for best detection.
+
+security_rules:
+  - context: payments
+    constraints:
+      - "No logging of card numbers, CVV, or full account numbers"
+      - "All external API calls must use HTTPS"
+      - "No PII in error messages or stack traces"
+      - "New dependencies require security review"
+
+  - context: orders
+    constraints:
+      - "Customer email/phone must not appear in debug logs"

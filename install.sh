@@ -2,7 +2,8 @@
 set -euo pipefail
 
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
-REPO_URL="https://raw.githubusercontent.com/phanendra-t/ArchagentCLI/main/archagent"
+SHARE_DIR="${SHARE_DIR:-$HOME/.local/share/archagent}"
+REPO_URL="https://raw.githubusercontent.com/phanendra-t/ArchagentCLI/main"
 
 echo "ArchAgent CLI Installer"
 echo
@@ -29,14 +30,19 @@ if [ "$missing" = 1 ]; then
     exit 1
 fi
 
-# Download and install
+# Download and install CLI script
 echo
 echo "Downloading archagent..."
 mkdir -p "$INSTALL_DIR"
-curl -fsSL "$REPO_URL" -o "$INSTALL_DIR/archagent"
+curl -fsSL "$REPO_URL/archagent" -o "$INSTALL_DIR/archagent"
 chmod +x "$INSTALL_DIR/archagent"
-
 echo "✓ Installed to $INSTALL_DIR/archagent"
+
+# Download example intent file
+echo "Downloading example files..."
+mkdir -p "$SHARE_DIR"
+curl -fsSL "$REPO_URL/architecture-intent.example.yaml" -o "$SHARE_DIR/architecture-intent.example.yaml"
+echo "✓ Cached example intent to $SHARE_DIR/"
 
 # PATH check
 if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
